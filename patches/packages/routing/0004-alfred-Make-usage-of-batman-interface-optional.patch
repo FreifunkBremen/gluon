@@ -1,0 +1,57 @@
+From: Jan-Philipp Litza <janphilipp@litza.de>
+Date: Tue, 14 Jul 2015 10:26:36 +0200
+Subject: alfred: Make usage of batman interface optional
+
+diff --git a/alfred/files/alfred.init b/alfred/files/alfred.init
+index b777b53..9e94038 100755
+--- a/alfred/files/alfred.init
++++ b/alfred/files/alfred.init
+@@ -39,7 +39,11 @@ alfred_start()
+ 	[ "$mode" = "master" ] && append args "-m"
+ 
+ 	config_get batmanif "$section" batmanif
+-	append args "-b $batmanif"
++	if [ -n "$batmanif" ]; then
++		append args "-b $batmanif"
++	else
++		append args "-b none"
++	fi
+ 
+ 	append alfred_args "$args"
+ 	enable=1
+@@ -64,18 +68,20 @@ start()
+ 		exit 0
+ 	fi
+ 
+-	mesh_dir="/sys/class/net/$batmanif/mesh/"
+-	if ! [ -d "$mesh_dir" ] ; then
+-		timeout=30
+-		echo "${initscript}: waiting $timeout secs for $batmanif interface..."
+-		for i in $(seq $timeout); do
+-			sleep 1
+-			[ -d "$mesh_dir" ] && break
+-			if [ $i == $timeout ] ; then
+-				echo "${initscript}: $batmanif not detected, alfred not starting."
+-				exit 1
+-			fi
+-		done
++	if [ -n "$batmanif" ]; then
++		mesh_dir="/sys/class/net/$batmanif/mesh/"
++		if ! [ -d "$mesh_dir" ] ; then
++			timeout=30
++			echo "${initscript}: waiting $timeout secs for $batmanif interface..."
++			for i in $(seq $timeout); do
++				sleep 1
++				[ -d "$mesh_dir" ] && break
++				if [ $i == $timeout ] ; then
++					echo "${initscript}: $batmanif not detected, alfred not starting."
++					exit 1
++				fi
++			done
++		fi
+ 	fi
+ 
+ 	echo "${initscript}: starting alfred"
+-- 
+2.1.4
+
