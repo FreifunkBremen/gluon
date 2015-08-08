@@ -61,6 +61,7 @@
 
 #define MAX_PREFIXES 8
 #define MAX_ROUTES 16
+#define MAX_INTERFACES 2
 
 /* These are in seconds */
 #define AdvValidLifetime 86400u
@@ -106,6 +107,7 @@ struct route {
 	uint32_t preferred_time;
 	uint32_t valid_time;
 	uint32_t metric;
+	int iface_index;
 };
 
 
@@ -116,21 +118,22 @@ static struct global {
 	struct timespec next_advert;
 	struct timespec last_advert;
 
-	int icmp_sock;
+	size_t n_client_ifs;
+	int icmp_socks_client[MAX_INTERFACES];
+	int icmp_sock_server;
 	int rtnl_sock;
 
 	int rtable;
 	const char *mesh_iface;
 
-	const char *ifname;
+	const char *ifnames_client[MAX_INTERFACES];
+	const char *ifname_server;
 
 	size_t n_prefixes;
 	struct prefix prefixes[MAX_PREFIXES];
 	size_t n_routes;
 	struct route routes[MAX_ROUTES];
 } G = {
-	.rtnl_sock = -1,
-	.icmp_sock = -1,
 	.rtable = -1,
 	.mesh_iface = "bat0",
 };
@@ -219,24 +222,36 @@ static inline int rand_range(int min, int max) {
 	return (r%(max-min) + min);
 }
 
-static void init_icmp(void) {
-	G.icmp_sock = socket(AF_INET6, SOCK_RAW|SOCK_NONBLOCK, IPPROTO_ICMPV6);
-	if (G.icmp_sock < 0)
+static int init_icmp_socket(int code) {
+	int sock = socket(AF_INET6, SOCK_RAW|SOCK_NONBLOCK, IPPROTO_ICMPV6);
+	if (sock < 0)
 		exit_errno("can't open ICMP socket");
 
-	setsockopt_int(G.icmp_sock, IPPROTO_RAW, IPV6_CHECKSUM, 2);
+	setsockopt_int(sock, IPPROTO_RAW, IPV6_CHECKSUM, 2);
 
-	setsockopt_int(G.icmp_sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, 255);
-	setsockopt_int(G.icmp_sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, 1);
+	setsockopt_int(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, 255);
+	setsockopt_int(sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, 1);
 
-	setsockopt_int(G.icmp_sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1);
+	setsockopt_int(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, 1);
 
 	struct icmp6_filter filter;
 	ICMP6_FILTER_SETBLOCKALL(&filter);
-	ICMP6_FILTER_SETPASS(ND_ROUTER_SOLICIT, &filter);
-	if (G.rtable != -1)
-		ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filter);
-	setsockopt(G.icmp_sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
+	ICMP6_FILTER_SETPASS(code, &filter);
+	setsockopt(G.icmp_sock_server, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
+
+	return sock;
+}
+
+static void init_icmp_server(void) {
+	G.icmp_sock_server = init_icmp_socket(ND_ROUTER_SOLICIT);
+}
+
+static void init_icmp_client(void) {
+	size_t i = 0;
+	for (i = 0; i < G.n_client_ifs; i++) {
+		G.icmp_socks_client[i] = init_icmp_socket(ND_ROUTER_ADVERT);
+		setsockopt(G.icmp_socks_client[i], SOL_SOCKET, SO_BINDTODEVICE, G.ifnames_client[i], strnlen(G.ifnames_client[i], IFNAMSIZ-1));
+	}
 }
 
 static void init_rtnl(void) {
@@ -284,7 +299,7 @@ static int join_multicast(void) {
 		.ipv6mr_interface = G.iface.ifindex,
 	};
 
-	if (setsockopt(G.icmp_sock, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0) {
+	if (setsockopt(G.icmp_sock_server, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0) {
 		return 2;
 	}
 	else if (errno != EADDRINUSE) {
@@ -302,14 +317,14 @@ static void update_interface(void) {
 	memset(&G.iface, 0, sizeof(struct iface));
 
 	/* Update ifindex */
-	G.iface.ifindex = if_nametoindex(G.ifname);
+	G.iface.ifindex = if_nametoindex(G.ifname_server);
 	if (!G.iface.ifindex)
 		return;
 
 	/* Update MAC address */
 	struct ifreq ifr = {};
-	strncpy(ifr.ifr_name, G.ifname, sizeof(ifr.ifr_name)-1);
-	if (ioctl(G.icmp_sock, SIOCGIFHWADDR, &ifr) < 0)
+	strncpy(ifr.ifr_name, G.ifname_server, sizeof(ifr.ifr_name)-1);
+	if (ioctl(G.icmp_sock_server, SIOCGIFHWADDR, &ifr) < 0)
 		return;
 
 	memcpy(G.iface.mac, ifr.ifr_hwaddr.sa_data, sizeof(G.iface.mac));
@@ -330,7 +345,7 @@ static void update_interface(void) {
 		if (!IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr))
 			continue;
 
-		if (strncmp(addr->ifa_name, G.ifname, IFNAMSIZ-1) != 0)
+		if (strncmp(addr->ifa_name, G.ifname_server, IFNAMSIZ-1) != 0)
 			continue;
 
 		G.iface.ifaddr = in6->sin6_addr;
@@ -345,7 +360,7 @@ static void update_interface(void) {
 	if (!joined)
 		return;
 
-	setsockopt(G.icmp_sock, SOL_SOCKET, SO_BINDTODEVICE, G.ifname, strnlen(G.ifname, IFNAMSIZ-1));
+	setsockopt(G.icmp_sock_server, SOL_SOCKET, SO_BINDTODEVICE, G.ifname_server, strnlen(G.ifname_server, IFNAMSIZ-1));
 
 	G.iface.ok = true;
 
@@ -495,7 +510,7 @@ static void handle_icmp_solicit(const struct msghdr *msg) {
 	schedule_advert(true);
 }
 
-static void handle_icmp_advert(const struct msghdr *msg) {
+static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 	struct nd_router_advert *buffer = msg->msg_iov->iov_base;
 	struct sockaddr_in6 *addr = msg->msg_name;
 	uint32_t metric = 512u;
@@ -584,6 +599,7 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 			.metric = metric,
 			.preferred_time = prefixes[i].preferred_time,
 			.valid_time = prefixes[i].valid_time,
+			.iface_index = iface_index,
 		};
 		memcpy(&route.gateway, &(addr->sin6_addr), sizeof(struct in6_addr));
 		for (j = 0; j < G.n_routes; j++) {
@@ -591,6 +607,9 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 				continue;
 
 			if (G.routes[j].from != route.from)
+				continue;
+
+			if (G.routes[j].iface_index != route.iface_index)
 				continue;
 
 			break;
@@ -604,7 +623,7 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 	schedule_advert(true);
 }
 
-static void handle_icmp(void) {
+static void handle_icmp(int sock, int iface_index) {
 	struct sockaddr_in6 addr;
 
 	uint8_t buffer[1500] __attribute__((aligned(8)));
@@ -622,7 +641,7 @@ static void handle_icmp(void) {
 		.msg_controllen = sizeof(cbuf),
 	};
 
-	ssize_t len = recvmsg(G.icmp_sock, &msg, 0);
+	ssize_t len = recvmsg(sock, &msg, 0);
 
 	if (len < (ssize_t)sizeof(struct nd_router_solicit) && len < (ssize_t)sizeof(struct nd_router_advert)) {
 		if (len < 0)
@@ -654,7 +673,7 @@ static void handle_icmp(void) {
 			handle_icmp_solicit(&msg);
 			break;
 		case ND_ROUTER_ADVERT:
-			handle_icmp_advert(&msg);
+			handle_icmp_advert(&msg, iface_index);
 			break;
 	}
 }
@@ -744,7 +763,7 @@ static void send_advert(void) {
 
 	add_pktinfo(&msg);
 
-	if (sendmsg(G.icmp_sock, &msg, 0) < 0) {
+	if (sendmsg(G.icmp_sock_server, &msg, 0) < 0) {
 		G.iface.ok = false;
 		return;
 	}
@@ -800,15 +819,22 @@ static void parse_cmdline(int argc, char *argv[]) {
 	while ((c = getopt(argc, argv, "i:a:p:h")) != -1) {
 		switch(c) {
 		case 'i':
-			if (G.ifname)
-				error(1, 0, "multiple interfaces are not supported.");
+			if (G.ifname_server)
+				error(1, 0, "multiple server interfaces are not supported.");
 
-			G.ifname = optarg;
+			G.ifname_server = optarg;
 
 			break;
 
 		case 'a':
 			add_prefix(optarg, false);
+			break;
+
+		case 'l':
+			if (G.n_client_ifs >= MAX_INTERFACES)
+				error(1, 0, "maximal number of client interfaces reached.");
+
+			G.ifnames_client[G.n_client_ifs++] = optarg;
 			break;
 
 		case 'p':
@@ -835,13 +861,15 @@ static void parse_cmdline(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+	size_t i;
 	parse_cmdline(argc, argv);
 
-	if (!G.ifname || !G.n_prefixes)
+	if (!G.ifname_server || !G.n_prefixes)
 		error(1, 0, "interface and prefix arguments are required.");
 
 	init_random();
-	init_icmp();
+	init_icmp_server();
+	init_icmp_client();
 	init_rtnl();
 
 	update_time();
@@ -850,10 +878,11 @@ int main(int argc, char *argv[]) {
 	update_interface();
 
 	while (true) {
-		struct pollfd fds[2] = {
-			{ .fd = G.icmp_sock, .events = POLLIN },
-			{ .fd = G.rtnl_sock, .events = POLLIN },
-		};
+		struct pollfd fds[2+G.n_client_ifs];
+		fds[0] = (struct pollfd){ .fd = G.icmp_sock_server, .events = POLLIN };
+		fds[1] = (struct pollfd){ .fd = G.rtnl_sock, .events = POLLIN };
+		for (i = 0; i < G.n_client_ifs; i++)
+			fds[i+2] = (struct pollfd){ .fd = G.icmp_socks_client[i], .events = POLLIN };
 
 		int timeout = -1;
 
@@ -864,16 +893,20 @@ int main(int argc, char *argv[]) {
 				timeout = 0;
 		}
 
-		int ret = poll(fds, 2, timeout);
+		int ret = poll(fds, 2+G.n_client_ifs, timeout);
 		if (ret < 0)
 			exit_errno("poll");
 
 		update_time();
 
 		if (fds[0].revents & POLLIN)
-			handle_icmp();
+			handle_icmp(fds[0].fd, -1);
 		if (fds[1].revents & POLLIN)
 			handle_rtnl();
+		for (i = 0; i < G.n_client_ifs; i++) {
+			if (fds[i+2].revents & POLLIN)
+				handle_icmp(fds[i+2].fd, i);
+		}
 
 		if (timespec_after(&G.time, &G.next_advert))
 			send_advert();
