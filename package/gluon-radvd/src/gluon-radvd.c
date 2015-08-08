@@ -92,15 +92,20 @@ struct iface {
 
 
 struct prefix {
-	struct in6_addr *addr;
+	struct in6_addr addr;
+	uint32_t preferred_time;
+	uint32_t valid_time;
 	uint8_t len;
+	bool onlink;
+	bool manual;
 };
 
 struct route {
 	struct in6_addr gateway;
-	struct prefix from;
+	struct prefix *from;
+	uint32_t preferred_time;
+	uint32_t valid_time;
 	uint32_t metric;
-	uint32_t lifetime;
 };
 
 
@@ -120,8 +125,7 @@ static struct global {
 	const char *ifname;
 
 	size_t n_prefixes;
-	struct in6_addr prefixes[MAX_PREFIXES];
-	bool prefixes_onlink[MAX_PREFIXES];
+	struct prefix prefixes[MAX_PREFIXES];
 	size_t n_routes;
 	struct route routes[MAX_ROUTES];
 } G = {
@@ -488,7 +492,7 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 	struct sockaddr_in6 *addr = msg->msg_name;
 	uint32_t metric = 512u;
 	size_t n_prefixes;
-	struct nd_opt_prefix_info *prefixes[MAX_PREFIXES];
+	struct prefix prefixes[MAX_PREFIXES];
 	const struct nd_opt_prefix_info *opt = (struct nd_opt_prefix_info *)(buffer + sizeof(struct nd_router_advert)),
 					*end = (struct nd_opt_prefix_info *)(buffer + msg->msg_iov->iov_len);
 
@@ -513,10 +517,17 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 		if (opt->nd_opt_pi_prefix_len < 64)
 			continue;
 
-		if (!(opt->nd_opt_pi_flags_reserved & 0x40)) // autonomous flag unset
+		if (!(opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_AUTO))
 			continue;
 
-		prefixes[n_prefixes++] = (struct nd_opt_prefix_info*) opt;
+		memcpy(&(prefixes[n_prefixes].addr), &(opt->nd_opt_pi_prefix), sizeof(struct in6_addr));
+		prefixes[n_prefixes] = (struct prefix){
+			.len = opt->nd_opt_pi_prefix_len,
+			.onlink = opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_ONLINK,
+			.preferred_time = ntohl(opt->nd_opt_pi_preferred_time),
+			.valid_time = ntohl(opt->nd_opt_pi_valid_time),
+		};
+		n_prefixes++;
 	}
 
 	if (opt != end)
@@ -539,26 +550,42 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 	size_t i, j;
 	for (i = 0; i < n_prefixes; i++) {
 		for (j = 0; j < G.n_prefixes; j++) {
-			if (!memcmp(&(G.prefixes[j]), &(prefixes[i]->nd_opt_pi_prefix), 8)) {
-				break;
+			if (memcmp(&G.prefixes[j].addr, &(prefixes[i].addr), sizeof(struct in6_addr)))
+				continue;
+
+			if (G.prefixes[j].len != prefixes[i].len)
+				continue;
+
+			if (!G.prefixes[j].manual) {
+				if (G.prefixes[j].valid_time < prefixes[i].valid_time)
+					G.prefixes[j].valid_time = prefixes[i].valid_time;
+
+				if (G.prefixes[j].preferred_time < prefixes[i].preferred_time)
+					G.prefixes[j].preferred_time = prefixes[i].preferred_time;
 			}
+
+			break;
 		}
-		if (j == G.n_prefixes)
+		if (j == G.n_prefixes) {
+			memcpy(&(G.prefixes[G.n_prefixes]), &prefixes[i], sizeof(struct prefix));
 			G.n_prefixes++;
-		memcpy(&(G.prefixes[j]), &(prefixes[i]->nd_opt_pi_prefix), sizeof(struct in6_addr));
+		}
+
 		struct route route = {
-			.from = {
-				.addr = &G.prefixes[j],
-				.len = prefixes[i]->nd_opt_pi_prefix_len,
-			},
+			.from = &G.prefixes[j],
 			.metric = metric,
-			.lifetime = prefixes[i]->nd_opt_pi_preferred_time,
+			.preferred_time = prefixes[i].preferred_time,
+			.valid_time = prefixes[i].valid_time,
 		};
 		memcpy(&route.gateway, &(addr->sin6_addr), sizeof(struct in6_addr));
 		for (j = 0; j < G.n_routes; j++) {
-			if (!memcmp(&(G.routes[j]), &route, sizeof(struct in6_addr) + sizeof(struct prefix))) {
-				break;
-			}
+			if (memcmp(&G.routes[j].gateway, &route.gateway, sizeof(struct in6_addr)))
+				continue;
+
+			if (G.routes[j].from != route.from)
+				continue;
+
+			break;
 		}
 		if (j == G.n_routes)
 			G.n_routes++;
@@ -644,17 +671,17 @@ static void send_advert(void) {
 	for (i = 0; i < G.n_prefixes; i++) {
 		uint8_t flags = ND_OPT_PI_FLAG_AUTO;
 
-		if (G.prefixes_onlink[i])
+		if (G.prefixes[i].onlink)
 			flags |= ND_OPT_PI_FLAG_ONLINK;
 
 		prefixes[i] = (struct nd_opt_prefix_info){
 			.nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION,
 			.nd_opt_pi_len = 4,
-			.nd_opt_pi_prefix_len = 64,
+			.nd_opt_pi_prefix_len = G.prefixes[i].len,
 			.nd_opt_pi_flags_reserved = flags,
-			.nd_opt_pi_valid_time = htonl(AdvValidLifetime),
-			.nd_opt_pi_preferred_time = htonl(AdvPreferredLifetime),
-			.nd_opt_pi_prefix = G.prefixes[i],
+			.nd_opt_pi_valid_time = htonl(G.prefixes[i].valid_time),
+			.nd_opt_pi_preferred_time = htonl(G.prefixes[i].preferred_time),
+			.nd_opt_pi_prefix = G.prefixes[i].addr,
 		};
 	}
 
@@ -723,15 +750,19 @@ static void add_prefix(const char *prefix, bool adv_onlink) {
 			goto error;
 	}
 
-	if (inet_pton(AF_INET6, prefix2, &G.prefixes[G.n_prefixes]) != 1)
+	if (inet_pton(AF_INET6, prefix2, &G.prefixes[G.n_prefixes].addr) != 1)
 		goto error;
 
-	// clear last 64 bits of address
 	static const uint8_t zero[8] = {};
-	if (memcmp(G.prefixes[G.n_prefixes].s6_addr + 8, zero, 8) != 0)
+	if (memcmp(&G.prefixes[G.n_prefixes].addr + 8, zero, 8) != 0)
 		goto error;
 
-	G.prefixes_onlink[G.n_prefixes] = adv_onlink;
+	G.prefixes[G.n_prefixes] = (struct prefix){
+		.manual = true,
+		.onlink = adv_onlink,
+		.preferred_time = AdvPreferredLifetime,
+		.valid_time = AdvValidLifetime,
+	};
 
 	G.n_prefixes++;
 	return;
