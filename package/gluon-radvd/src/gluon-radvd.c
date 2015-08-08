@@ -107,6 +107,7 @@ struct route {
 	uint32_t preferred_time;
 	uint32_t valid_time;
 	uint32_t metric;
+	uint8_t preference;
 	int iface_index;
 };
 
@@ -471,11 +472,44 @@ static void add_pktinfo(struct msghdr *msg) {
 }
 
 
+static void update_lifetimes(unsigned int elapsed) {
+	size_t i;
+	for (i = 0; i < G.n_prefixes; i++) {
+		if (G.prefixes[i].manual)
+			continue;
+		diff_max_zero(&G.prefixes[i].valid_time, elapsed);
+		diff_max_zero(&G.prefixes[i].preferred_time, elapsed);
+	}
+	for (i = 0; i < G.n_routes; i++) {
+		diff_max_zero(&G.routes[i].valid_time, elapsed);
+		diff_max_zero(&G.routes[i].preferred_time, elapsed);
+	}
+}
+
+static void update_metrics(void) {
+	size_t i;
+	for (i = 0; i < G.n_routes; i++) {
+		G.routes[i].metric = 512;
+		switch(G.routes[i].preference) {
+			case 0x01: // high (01b)
+				G.routes[i].metric -= 128;
+				break;
+			case 0x03: // low (11b)
+				G.routes[i].metric += 128;
+				break;
+		}
+		// TODO: open debugfs files only once for all routes
+		G.routes[i].metric -= get_tq_from_ipv6(&(G.routes[i].gateway));
+	}
+}
+
+
 static void insert_route(const struct route *route) {
 	// TODO
 }
 
 static void update_routes(void) {
+	update_metrics();
 	size_t i;
 	for (i = 0; i < G.n_routes; i++) {
 		insert_route(&(G.routes[i]));
@@ -513,7 +547,6 @@ static void handle_icmp_solicit(const struct msghdr *msg) {
 static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 	struct nd_router_advert *buffer = msg->msg_iov->iov_base;
 	struct sockaddr_in6 *addr = msg->msg_name;
-	uint32_t metric = 512u;
 	size_t n_prefixes;
 	struct prefix prefixes[MAX_PREFIXES];
 	const struct nd_opt_prefix_info *opt = (struct nd_opt_prefix_info *)(buffer + sizeof(struct nd_router_advert)),
@@ -556,25 +589,13 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			.preferred_time = ntohl(opt->nd_opt_pi_preferred_time),
 			.valid_time = ntohl(opt->nd_opt_pi_valid_time),
 		};
+
 		n_prefixes++;
 	}
 
 	if (opt != end)
 		return;
 
-
-	// determine router preference (RFC 4191)
-	switch((buffer->nd_ra_hdr.icmp6_data8[1] & 0x16) >> 3) {
-		case 0x01: // high (01b)
-			metric -= 128;
-			break;
-		case 0x03: // low (11b)
-			metric += 128;
-			break;
-	}
-	// determine quality of connection to originator
-	metric -= get_tq_from_ipv6(&(addr->sin6_addr));
-	
 	// insert routes
 	size_t i, j;
 	for (i = 0; i < n_prefixes; i++) {
@@ -605,10 +626,10 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 
 		struct route route = {
 			.from = &G.prefixes[j],
-			.metric = metric,
 			.preferred_time = prefixes[i].preferred_time,
 			.valid_time = prefixes[i].valid_time,
 			.iface_index = iface_index,
+			.preference = (buffer->nd_ra_hdr.icmp6_data8[1] & 0x16) >> 3, // RFC 4191
 		};
 		memcpy(&route.gateway, &(addr->sin6_addr), sizeof(struct in6_addr));
 		for (j = 0; j < G.n_routes; j++) {
@@ -691,26 +712,13 @@ static void handle_icmp(int sock, int iface_index) {
 	}
 }
 
-static void update_lifetimes(unsigned int elapsed) {
-	size_t i;
-	for (i = 0; i < G.n_prefixes; i++) {
-		if (G.prefixes[i].manual)
-			continue;
-		diff_max_zero(&G.prefixes[i].valid_time, elapsed);
-		diff_max_zero(&G.prefixes[i].preferred_time, elapsed);
-	}
-	for (i = 0; i < G.n_routes; i++) {
-		diff_max_zero(&G.routes[i].valid_time, elapsed);
-		diff_max_zero(&G.routes[i].preferred_time, elapsed);
-	}
-}
-
 
 static void send_advert(void) {
 	if (!G.iface.ok)
 		return;
 
 	update_lifetimes(timespec_diff(&G.time, &G.last_advert) / 1000);
+	update_metrics();
 
 	struct nd_router_advert advert = {
 		.nd_ra_hdr = {
