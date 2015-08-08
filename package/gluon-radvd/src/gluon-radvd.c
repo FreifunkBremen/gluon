@@ -114,7 +114,7 @@ static struct global {
 
 	struct timespec time;
 	struct timespec next_advert;
-	struct timespec next_advert_earliest;
+	struct timespec last_advert;
 
 	int icmp_sock;
 	int rtnl_sock;
@@ -168,6 +168,13 @@ static inline void timespec_add(struct timespec *tp, unsigned int ms) {
 		tp->tv_nsec -= 1e9;
 		tp->tv_sec++;
 	}
+}
+
+static inline void diff_max_zero(unsigned int *minuend, unsigned int subtrahend) {
+	if (*minuend < subtrahend)
+		*minuend = 0;
+	else
+		*minuend -= subtrahend;
 }
 
 
@@ -247,15 +254,16 @@ static void init_rtnl(void) {
 
 
 static void schedule_advert(bool nodelay) {
-	struct timespec t = G.time;
+	struct timespec t = G.time, next_advert_earliest = G.last_advert;
 
 	if (nodelay)
 		timespec_add(&t, rand_range(0, MAX_RA_DELAY_TIME));
 	else
 		timespec_add(&t, rand_range(MinRtrAdvInterval*1000, MaxRtrAdvInterval*1000));
 
-	if (timespec_after(&G.next_advert_earliest, &t))
-		t = G.next_advert_earliest;
+	timespec_add(&next_advert_earliest, MIN_DELAY_BETWEEN_RAS);
+	if (timespec_after(&next_advert_earliest, &t))
+		t = next_advert_earliest;
 
 	if (!nodelay || timespec_after(&G.next_advert, &t))
 		G.next_advert = t;
@@ -520,8 +528,8 @@ static void handle_icmp_advert(const struct msghdr *msg) {
 		if (!(opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_AUTO))
 			continue;
 
-		memcpy(&(prefixes[n_prefixes].addr), &(opt->nd_opt_pi_prefix), sizeof(struct in6_addr));
 		prefixes[n_prefixes] = (struct prefix){
+			.addr = opt->nd_opt_pi_prefix,
 			.len = opt->nd_opt_pi_prefix_len,
 			.onlink = opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_ONLINK,
 			.preferred_time = ntohl(opt->nd_opt_pi_preferred_time),
@@ -651,9 +659,26 @@ static void handle_icmp(void) {
 	}
 }
 
+static void update_lifetimes(unsigned int elapsed) {
+	size_t i;
+	for (i = 0; i < G.n_prefixes; i++) {
+		if (G.prefixes[i].manual)
+			continue;
+		diff_max_zero(&G.prefixes[i].valid_time, elapsed);
+		diff_max_zero(&G.prefixes[i].preferred_time, elapsed);
+	}
+	for (i = 0; i < G.n_routes; i++) {
+		diff_max_zero(&G.routes[i].valid_time, elapsed);
+		diff_max_zero(&G.routes[i].preferred_time, elapsed);
+	}
+}
+
+
 static void send_advert(void) {
 	if (!G.iface.ok)
 		return;
+
+	update_lifetimes(timespec_diff(&G.time, &G.last_advert) / 1000);
 
 	struct nd_router_advert advert = {
 		.nd_ra_hdr = {
@@ -724,8 +749,7 @@ static void send_advert(void) {
 		return;
 	}
 
-	G.next_advert_earliest = G.time;
-	timespec_add(&G.next_advert_earliest, MIN_DELAY_BETWEEN_RAS);
+	G.last_advert = G.time;
 
 	schedule_advert(false);
 }
@@ -821,7 +845,7 @@ int main(int argc, char *argv[]) {
 	init_rtnl();
 
 	update_time();
-	G.next_advert = G.next_advert_earliest = G.time;
+	G.next_advert = G.time;
 
 	update_interface();
 
