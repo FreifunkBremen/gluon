@@ -543,6 +543,12 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 		if (!(opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_AUTO))
 			continue;
 
+		if (n_prefixes >= MAX_PREFIXES)
+			// we cannot store any more prefixes, but need to
+			// validate the rest of the packet, thus no break
+			// TODO: warn to syslog
+			continue;
+
 		prefixes[n_prefixes] = (struct prefix){
 			.addr = opt->nd_opt_pi_prefix,
 			.len = opt->nd_opt_pi_prefix_len,
@@ -590,6 +596,9 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			break;
 		}
 		if (j == G.n_prefixes) {
+			if (G.n_prefixes == MAX_PREFIXES)
+				// TODO: warn to syslog
+				continue;
 			memcpy(&(G.prefixes[G.n_prefixes]), &prefixes[i], sizeof(struct prefix));
 			G.n_prefixes++;
 		}
@@ -614,8 +623,12 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 
 			break;
 		}
-		if (j == G.n_routes)
+		if (j == G.n_routes) {
+			if (G.n_routes == MAX_ROUTES)
+				// TODO: warn to syslog
+				continue;
 			G.n_routes++;
+		}
 		memcpy(&(G.routes[j]), &route, sizeof(struct route));
 	}
 
