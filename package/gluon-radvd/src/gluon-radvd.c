@@ -44,6 +44,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
+#include <net/ethernet.h>
 #include <net/if.h>
 
 #include <netinet/in.h>
@@ -55,8 +56,11 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 
+#include "batadv_query.h"
+
 
 #define MAX_PREFIXES 8
+#define MAX_ROUTES 16
 
 /* These are in seconds */
 #define AdvValidLifetime 86400u
@@ -86,6 +90,20 @@ struct iface {
 	uint8_t mac[6];
 };
 
+
+struct prefix {
+	struct in6_addr *addr;
+	uint8_t len;
+};
+
+struct route {
+	struct in6_addr gateway;
+	struct prefix from;
+	uint32_t metric;
+	uint32_t lifetime;
+};
+
+
 static struct global {
 	struct iface iface;
 
@@ -96,14 +114,21 @@ static struct global {
 	int icmp_sock;
 	int rtnl_sock;
 
+	int rtable;
+	const char *mesh_iface;
+
 	const char *ifname;
 
 	size_t n_prefixes;
 	struct in6_addr prefixes[MAX_PREFIXES];
 	bool prefixes_onlink[MAX_PREFIXES];
+	size_t n_routes;
+	struct route routes[MAX_ROUTES];
 } G = {
 	.rtnl_sock = -1,
 	.icmp_sock = -1,
+	.rtable = -1,
+	.mesh_iface = "bat0",
 };
 
 
@@ -139,6 +164,23 @@ static inline void timespec_add(struct timespec *tp, unsigned int ms) {
 		tp->tv_nsec -= 1e9;
 		tp->tv_sec++;
 	}
+}
+
+
+static uint8_t get_tq_from_ipv6(const struct in6_addr *addr) {
+	struct ether_addr *originator;
+	struct ether_addr mac;
+	if (strcmp(G.mesh_iface, "none") != 0) {
+		if (ipv6_to_mac(addr, &mac) >= 0) {
+			originator = translate_mac(G.mesh_iface,
+						(struct ether_addr *)&mac);
+			if (originator)
+				return get_tq(G.mesh_iface, originator);
+			else
+				return 0;
+		}
+	}
+	return 255;
 }
 
 
@@ -181,6 +223,8 @@ static void init_icmp(void) {
 	struct icmp6_filter filter;
 	ICMP6_FILTER_SETBLOCKALL(&filter);
 	ICMP6_FILTER_SETPASS(ND_ROUTER_SOLICIT, &filter);
+	if (G.rtable != -1)
+		ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filter);
 	setsockopt(G.icmp_sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
 }
 
@@ -400,7 +444,132 @@ static void add_pktinfo(struct msghdr *msg) {
 }
 
 
-static void handle_solicit(void) {
+static void insert_route(const struct route *route) {
+	// TODO
+}
+
+static void update_routes(void) {
+	size_t i;
+	for (i = 0; i < G.n_routes; i++) {
+		insert_route(&(G.routes[i]));
+	}
+}
+
+
+static void handle_icmp_solicit(const struct msghdr *msg) {
+	uint8_t *buffer = msg->msg_iov->iov_base;
+	struct sockaddr_in6 *addr = msg->msg_name;
+	const struct nd_opt_hdr *opt = (struct nd_opt_hdr *)(buffer + sizeof(struct nd_router_solicit)),
+				*end = (struct nd_opt_hdr *)(buffer + msg->msg_iov->iov_len);
+
+	// validate packet according to RFC 4861 section 6.1.1
+	for (; opt < end; opt += opt->nd_opt_len) {
+		if (opt+1 < end)
+			return;
+
+		if (!opt->nd_opt_len)
+			return;
+
+		if (opt+opt->nd_opt_len < end)
+			return;
+
+		if (opt->nd_opt_type == ND_OPT_SOURCE_LINKADDR && IN6_IS_ADDR_UNSPECIFIED(&(addr->sin6_addr)))
+			return;
+	}
+
+	if (opt != end)
+		return;
+
+	schedule_advert(true);
+}
+
+static void handle_icmp_advert(const struct msghdr *msg) {
+	struct nd_router_advert *buffer = msg->msg_iov->iov_base;
+	struct sockaddr_in6 *addr = msg->msg_name;
+	uint32_t metric = 512u;
+	size_t n_prefixes;
+	struct nd_opt_prefix_info *prefixes[MAX_PREFIXES];
+	const struct nd_opt_prefix_info *opt = (struct nd_opt_prefix_info *)(buffer + sizeof(struct nd_router_advert)),
+					*end = (struct nd_opt_prefix_info *)(buffer + msg->msg_iov->iov_len);
+
+	// gather routes
+	for (; opt < end; opt += opt->nd_opt_pi_len) {
+		// validate packet according to RFC 4861 section 6.1.1
+		if (opt+1 < end)
+			return;
+
+		if (!opt->nd_opt_pi_len)
+			return;
+
+		if (opt+opt->nd_opt_pi_len < end)
+			return;
+
+		if (opt->nd_opt_pi_type != ND_OPT_PREFIX_INFORMATION)
+			continue;
+
+		if (opt->nd_opt_pi_len != sizeof(struct nd_opt_prefix_info))
+			return;
+
+		if (opt->nd_opt_pi_prefix_len < 64)
+			continue;
+
+		if (!(opt->nd_opt_pi_flags_reserved & 0x40)) // autonomous flag unset
+			continue;
+
+		prefixes[n_prefixes++] = (struct nd_opt_prefix_info*) opt;
+	}
+
+	if (opt != end)
+		return;
+
+
+	// determine router preference (RFC 4191)
+	switch((buffer->nd_ra_hdr.icmp6_data8[1] & 0x16) >> 3) {
+		case 0x01: // high (01b)
+			metric -= 128;
+			break;
+		case 0x03: // low (11b)
+			metric += 128;
+			break;
+	}
+	// determine quality of connection to originator
+	metric -= get_tq_from_ipv6(&(addr->sin6_addr));
+	
+	// insert routes
+	size_t i, j;
+	for (i = 0; i < n_prefixes; i++) {
+		for (j = 0; j < G.n_prefixes; j++) {
+			if (!memcmp(&(G.prefixes[j]), &(prefixes[i]->nd_opt_pi_prefix), 8)) {
+				break;
+			}
+		}
+		if (j == G.n_prefixes)
+			G.n_prefixes++;
+		memcpy(&(G.prefixes[j]), &(prefixes[i]->nd_opt_pi_prefix), sizeof(struct in6_addr));
+		struct route route = {
+			.from = {
+				.addr = &G.prefixes[j],
+				.len = prefixes[i]->nd_opt_pi_prefix_len,
+			},
+			.metric = metric,
+			.lifetime = prefixes[i]->nd_opt_pi_preferred_time,
+		};
+		memcpy(&route.gateway, &(addr->sin6_addr), sizeof(struct in6_addr));
+		for (j = 0; j < G.n_routes; j++) {
+			if (!memcmp(&(G.routes[j]), &route, sizeof(struct in6_addr) + sizeof(struct prefix))) {
+				break;
+			}
+		}
+		if (j == G.n_routes)
+			G.n_routes++;
+		memcpy(&(G.routes[j]), &route, sizeof(struct route));
+	}
+
+	update_routes();
+	schedule_advert(true);
+}
+
+static void handle_icmp(void) {
 	struct sockaddr_in6 addr;
 
 	uint8_t buffer[1500] __attribute__((aligned(8)));
@@ -419,7 +588,8 @@ static void handle_solicit(void) {
 	};
 
 	ssize_t len = recvmsg(G.icmp_sock, &msg, 0);
-	if (len < (ssize_t)sizeof(struct nd_router_solicit)) {
+
+	if (len < (ssize_t)sizeof(struct nd_router_solicit) && len < (ssize_t)sizeof(struct nd_router_advert)) {
 		if (len < 0)
 			warn_errno("recvmsg");
 
@@ -440,30 +610,18 @@ static void handle_solicit(void) {
 		break;
 	}
 
-	const struct nd_router_solicit *s = (struct nd_router_solicit *)buffer;
-	if (s->nd_rs_hdr.icmp6_type != ND_ROUTER_SOLICIT || s->nd_rs_hdr.icmp6_code != 0)
+	const struct icmp6_hdr *s = (struct icmp6_hdr *)buffer;
+	if (s->icmp6_code != 0)
 		return;
 
-	const struct icmpv6_opt *opt = (struct icmpv6_opt *)(buffer + sizeof(struct nd_router_solicit)), *end = (struct icmpv6_opt *)(buffer+len);
-
-	for (; opt < end; opt += opt->length) {
-		if (opt+1 < end)
-			return;
-
-		if (!opt->length)
-			return;
-
-		if (opt+opt->length < end)
-			return;
-
-		if (opt->type == ND_OPT_SOURCE_LINKADDR && IN6_IS_ADDR_UNSPECIFIED(&addr.sin6_addr))
-			return;
+	switch (s->icmp6_type) {
+		case ND_ROUTER_SOLICIT:
+			handle_icmp_solicit(&msg);
+			break;
+		case ND_ROUTER_ADVERT:
+			handle_icmp_advert(&msg);
+			break;
 	}
-
-	if (opt != end)
-		return;
-
-	schedule_advert(true);
 }
 
 static void send_advert(void) {
@@ -547,7 +705,7 @@ static void send_advert(void) {
 
 
 static void usage(void) {
-	fprintf(stderr, "Usage: gluon-radvd [-h] -i <interface> -a/-p <prefix> [ -a/-p <prefix> ... ]\n");
+	fprintf(stderr, "Usage: gluon-radvd [-h] -i <interface> -m <mesh_iface> -t <routing table> -a/-p <prefix> [ -a/-p <prefix> ... ]\n");
 }
 
 static void add_prefix(const char *prefix, bool adv_onlink) {
@@ -568,6 +726,7 @@ static void add_prefix(const char *prefix, bool adv_onlink) {
 	if (inet_pton(AF_INET6, prefix2, &G.prefixes[G.n_prefixes]) != 1)
 		goto error;
 
+	// clear last 64 bits of address
 	static const uint8_t zero[8] = {};
 	if (memcmp(G.prefixes[G.n_prefixes].s6_addr + 8, zero, 8) != 0)
 		goto error;
@@ -604,6 +763,14 @@ static void parse_cmdline(int argc, char *argv[]) {
 		case 'h':
 			usage();
 			exit(0);
+
+		case 't':
+			G.rtable = atoi(optarg);
+			break;
+
+		case 'm':
+			G.mesh_iface = optarg;
+			break;
 
 		default:
 			usage();
@@ -649,7 +816,7 @@ int main(int argc, char *argv[]) {
 		update_time();
 
 		if (fds[0].revents & POLLIN)
-			handle_solicit();
+			handle_icmp();
 		if (fds[1].revents & POLLIN)
 			handle_rtnl();
 
