@@ -66,7 +66,7 @@
 /* These are in seconds */
 #define AdvValidLifetime 86400u
 #define AdvPreferredLifetime 14400u
-#define AdvDefaultLifetime 0u
+#define AdvDefaultLifetime 14400u
 #define AdvCurHopLimit 64u
 
 #define MinRtrAdvInterval 200u
@@ -106,7 +106,7 @@ struct route {
 	struct prefix *from;
 	uint32_t preferred_time;
 	uint32_t valid_time;
-	uint32_t metric;
+	int metric;
 	uint8_t preference;
 	int iface_index;
 };
@@ -124,7 +124,7 @@ static struct global {
 	int icmp_sock_server;
 	int rtnl_sock;
 
-	int rtable;
+	unsigned char rtable;
 	const char *mesh_iface;
 
 	const char *ifnames_client[MAX_INTERFACES];
@@ -238,7 +238,7 @@ static int init_icmp_socket(int code) {
 	struct icmp6_filter filter;
 	ICMP6_FILTER_SETBLOCKALL(&filter);
 	ICMP6_FILTER_SETPASS(code, &filter);
-	setsockopt(G.icmp_sock_server, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
+	setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
 
 	return sock;
 }
@@ -503,7 +503,7 @@ static void update_metrics(void) {
 	}
 }
 
-static void rtnl_addattr(struct nlmsghdr *n, int maxlen, int type, void *data, int datalen) {
+static int rtnl_addattr(struct nlmsghdr *n, int maxlen, int type, void *data, int datalen) {
 	int len = RTA_LENGTH(datalen);
 	struct rtattr *rta;
 	if (NLMSG_ALIGN(n->nlmsg_len) + len > maxlen)
@@ -513,6 +513,7 @@ static void rtnl_addattr(struct nlmsghdr *n, int maxlen, int type, void *data, i
 	rta->rta_len = len;
 	memcpy(RTA_DATA(rta), data, datalen);
 	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + len;
+	return 0;
 }
 
 static void update_routes(void) {
@@ -524,6 +525,7 @@ static void update_routes(void) {
 		.nl = {
 			.nlmsg_type = RTM_NEWROUTE,
 			.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE,
+			.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg)),
 		},
 		.rt = {
 			.rtm_family = AF_INET6,
@@ -531,9 +533,6 @@ static void update_routes(void) {
 			.rtm_protocol = 158,
 			.rtm_scope = RT_SCOPE_UNIVERSE,
 			.rtm_type = RTN_UNICAST,
-			.rtm_tos = 0,
-			.rtm_flags = 0,
-			.rtm_dst_len = 0,
 		},
 	};
 	struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
@@ -541,9 +540,8 @@ static void update_routes(void) {
 	struct msghdr msg = { &nladdr, sizeof(nladdr), &iov, 1, NULL, 0, 0 };
 	struct in6_addr dst = {};
 	size_t i, base_size;
-	int fd, ifidx;
-
-	update_metrics();
+	int fd;
+	unsigned int ifidx;
 
 	fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
 	rtnl_addattr(&req.nl, sizeof(req), RTA_DST, &dst, sizeof(struct in6_addr));
@@ -553,11 +551,13 @@ static void update_routes(void) {
 		req.nl.nlmsg_len = base_size;
 		req.rt.rtm_src_len = G.routes[i].from->len;
 		rtnl_addattr(&req.nl, sizeof(req), RTA_GATEWAY, &G.routes[i].gateway, sizeof(struct in6_addr));
-		rtnl_addattr(&req.nl, sizeof(req), RTA_METRICS, &G.routes[i].metric, sizeof(uint32_t));
+		rtnl_addattr(&req.nl, sizeof(req), RTA_PRIORITY, &G.routes[i].metric, sizeof(int));
 		rtnl_addattr(&req.nl, sizeof(req), RTA_SRC, &G.routes[i].from->addr, sizeof(struct in6_addr));
-		rtnl_addattr(&req.nl, sizeof(req), RTA_OIF, &ifidx, sizeof(int));
+		rtnl_addattr(&req.nl, sizeof(req), RTA_OIF, &ifidx, sizeof(unsigned int));
 		iov.iov_len = req.nl.nlmsg_len;
-		sendmsg(fd, &msg, 0);
+		if (sendmsg(fd, &msg, 0) < 0)
+			perror("nl_sendmsg");
+		req.nl.nlmsg_seq++;
 	}
 	close(fd);
 }
@@ -566,21 +566,21 @@ static void update_routes(void) {
 static void handle_icmp_solicit(const struct msghdr *msg) {
 	uint8_t *buffer = msg->msg_iov->iov_base;
 	struct sockaddr_in6 *addr = msg->msg_name;
-	const struct nd_opt_hdr *opt = (struct nd_opt_hdr *)(buffer + sizeof(struct nd_router_solicit)),
-				*end = (struct nd_opt_hdr *)(buffer + msg->msg_iov->iov_len);
+	const struct icmpv6_opt *opt = (struct icmpv6_opt *)(buffer + sizeof(struct nd_router_solicit)),
+				*end = (struct icmpv6_opt *)(buffer + msg->msg_iov->iov_len);
 
 	// validate packet according to RFC 4861 section 6.1.1
-	for (; opt < end; opt += opt->nd_opt_len) {
+	for (; opt < end; opt += opt->length) {
 		if (opt+1 < end)
 			return;
 
-		if (!opt->nd_opt_len)
+		if (!opt->length)
 			return;
 
-		if (opt+opt->nd_opt_len < end)
+		if (opt+opt->length < end)
 			return;
 
-		if (opt->nd_opt_type == ND_OPT_SOURCE_LINKADDR && IN6_IS_ADDR_UNSPECIFIED(&(addr->sin6_addr)))
+		if (opt->type == ND_OPT_SOURCE_LINKADDR && IN6_IS_ADDR_UNSPECIFIED(&(addr->sin6_addr)))
 			return;
 	}
 
@@ -590,36 +590,37 @@ static void handle_icmp_solicit(const struct msghdr *msg) {
 	schedule_advert(true);
 }
 
-static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
-	struct nd_router_advert *buffer = msg->msg_iov->iov_base;
+static void handle_icmp_advert(const struct msghdr *msg, unsigned int iface_index) {
+	if (iface_index < 0)
+		return;
+	uint8_t *buffer = msg->msg_iov->iov_base;
 	struct sockaddr_in6 *addr = msg->msg_name;
 	size_t n_prefixes;
 	struct prefix prefixes[MAX_PREFIXES];
-	const struct nd_opt_prefix_info *opt = (struct nd_opt_prefix_info *)(buffer + sizeof(struct nd_router_advert)),
-					*end = (struct nd_opt_prefix_info *)(buffer + msg->msg_iov->iov_len);
+	const struct icmpv6_opt *opt = (struct icmpv6_opt *)(buffer + sizeof(struct nd_router_advert)),
+				*end = (struct icmpv6_opt *)(buffer + msg->msg_iov->iov_len);
+	const struct nd_opt_prefix_info *piopt;
 
 	// gather routes
-	for (; opt < end; opt += opt->nd_opt_pi_len) {
+	for (; opt < end; opt += opt->length) {
 		// validate packet according to RFC 4861 section 6.1.1
-		if (opt+1 < end)
+		if (!opt->length)
 			return;
 
-		if (!opt->nd_opt_pi_len)
+		if (opt+opt->length > end)
 			return;
 
-		if (opt+opt->nd_opt_pi_len < end)
-			return;
-
-		if (opt->nd_opt_pi_type != ND_OPT_PREFIX_INFORMATION)
+		if (opt->type != ND_OPT_PREFIX_INFORMATION)
 			continue;
 
-		if (opt->nd_opt_pi_len != sizeof(struct nd_opt_prefix_info))
+		piopt = (struct nd_opt_prefix_info*) opt;
+		if (piopt->nd_opt_pi_len*8 != sizeof(struct nd_opt_prefix_info))
 			return;
 
-		if (opt->nd_opt_pi_prefix_len < 64)
+		if (piopt->nd_opt_pi_prefix_len < 64)
 			continue;
 
-		if (!(opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_AUTO))
+		if (!(piopt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_AUTO))
 			continue;
 
 		if (n_prefixes >= MAX_PREFIXES)
@@ -629,11 +630,11 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			continue;
 
 		prefixes[n_prefixes] = (struct prefix){
-			.addr = opt->nd_opt_pi_prefix,
-			.len = opt->nd_opt_pi_prefix_len,
-			.onlink = opt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_ONLINK,
-			.preferred_time = ntohl(opt->nd_opt_pi_preferred_time),
-			.valid_time = ntohl(opt->nd_opt_pi_valid_time),
+			.addr = piopt->nd_opt_pi_prefix,
+			.len = piopt->nd_opt_pi_prefix_len,
+			.onlink = piopt->nd_opt_pi_flags_reserved & ND_OPT_PI_FLAG_ONLINK,
+			.preferred_time = ntohl(piopt->nd_opt_pi_preferred_time),
+			.valid_time = ntohl(piopt->nd_opt_pi_valid_time),
 		};
 
 		n_prefixes++;
@@ -663,9 +664,11 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			break;
 		}
 		if (j == G.n_prefixes) {
-			if (G.n_prefixes == MAX_PREFIXES)
+			if (G.n_prefixes == MAX_PREFIXES) {
 				// TODO: warn to syslog
+				fprintf(stderr, "Dropping prefix: MAX_PREFIXES reached\n");
 				continue;
+			}
 			memcpy(&(G.prefixes[G.n_prefixes]), &prefixes[i], sizeof(struct prefix));
 			G.n_prefixes++;
 		}
@@ -675,7 +678,7 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			.preferred_time = prefixes[i].preferred_time,
 			.valid_time = prefixes[i].valid_time,
 			.iface_index = iface_index,
-			.preference = (buffer->nd_ra_hdr.icmp6_data8[1] & 0x16) >> 3, // RFC 4191
+			.preference = (((struct nd_router_advert*)msg->msg_iov->iov_base)->nd_ra_hdr.icmp6_data8[1] & 0x16) >> 3, // RFC 4191
 		};
 		memcpy(&route.gateway, &(addr->sin6_addr), sizeof(struct in6_addr));
 		for (j = 0; j < G.n_routes; j++) {
@@ -691,9 +694,11 @@ static void handle_icmp_advert(const struct msghdr *msg, int iface_index) {
 			break;
 		}
 		if (j == G.n_routes) {
-			if (G.n_routes == MAX_ROUTES)
+			if (G.n_routes == MAX_ROUTES) {
 				// TODO: warn to syslog
+				fprintf(stderr, "Dropping route: MAX_ROUTES reached\n");
 				continue;
+			}
 			G.n_routes++;
 		}
 		memcpy(&(G.routes[j]), &route, sizeof(struct route));
@@ -730,6 +735,8 @@ static void handle_icmp(int sock, int iface_index) {
 		return;
 	}
 
+	vec.iov_len = len;
+
 	struct cmsghdr *cmsg;
 	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
 		if (cmsg->cmsg_level != IPPROTO_IPV6)
@@ -764,7 +771,6 @@ static void send_advert(void) {
 		return;
 
 	update_lifetimes(timespec_diff(&G.time, &G.last_advert) / 1000);
-	update_metrics();
 
 	struct nd_router_advert advert = {
 		.nd_ra_hdr = {
@@ -981,6 +987,9 @@ int main(int argc, char *argv[]) {
 			if (fds[i+2].revents & POLLIN)
 				handle_icmp(fds[i+2].fd, i);
 		}
+
+		update_metrics();
+		update_routes();
 
 		if (timespec_after(&G.time, &G.next_advert))
 			send_advert();
