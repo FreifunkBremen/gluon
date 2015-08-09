@@ -503,17 +503,63 @@ static void update_metrics(void) {
 	}
 }
 
-
-static void insert_route(const struct route *route) {
-	// TODO
+static void rtnl_addattr(struct nlmsghdr *n, int maxlen, int type, void *data, int datalen) {
+	int len = RTA_LENGTH(datalen);
+	struct rtattr *rta;
+	if (NLMSG_ALIGN(n->nlmsg_len) + len > maxlen)
+		return -1;
+	rta = (struct rtattr*)(((char*)n) + NLMSG_ALIGN(n->nlmsg_len));
+	rta->rta_type = type;
+	rta->rta_len = len;
+	memcpy(RTA_DATA(rta), data, datalen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + len;
 }
 
 static void update_routes(void) {
+	struct {
+		struct nlmsghdr nl;
+		struct rtmsg rt;
+		char buf[1024];
+	} req = {
+		.nl = {
+			.nlmsg_type = RTM_NEWROUTE,
+			.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE,
+		},
+		.rt = {
+			.rtm_family = AF_INET6,
+			.rtm_table = G.rtable,
+			.rtm_protocol = 158,
+			.rtm_scope = RT_SCOPE_UNIVERSE,
+			.rtm_type = RTN_UNICAST,
+			.rtm_tos = 0,
+			.rtm_flags = 0,
+			.rtm_dst_len = 0,
+		},
+	};
+	struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
+	struct iovec iov = { &req, 0 };
+	struct msghdr msg = { &nladdr, sizeof(nladdr), &iov, 1, NULL, 0, 0 };
+	struct in6_addr dst = {};
+	size_t i, base_size;
+	int fd, ifidx;
+
 	update_metrics();
-	size_t i;
+
+	fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+	rtnl_addattr(&req.nl, sizeof(req), RTA_DST, &dst, sizeof(struct in6_addr));
+	base_size = req.nl.nlmsg_len;
 	for (i = 0; i < G.n_routes; i++) {
-		insert_route(&(G.routes[i]));
+		ifidx = if_nametoindex(G.ifnames_client[G.routes[i].iface_index]);
+		req.nl.nlmsg_len = base_size;
+		req.rt.rtm_src_len = G.routes[i].from->len;
+		rtnl_addattr(&req.nl, sizeof(req), RTA_GATEWAY, &G.routes[i].gateway, sizeof(struct in6_addr));
+		rtnl_addattr(&req.nl, sizeof(req), RTA_METRICS, &G.routes[i].metric, sizeof(uint32_t));
+		rtnl_addattr(&req.nl, sizeof(req), RTA_SRC, &G.routes[i].from->addr, sizeof(struct in6_addr));
+		rtnl_addattr(&req.nl, sizeof(req), RTA_OIF, &ifidx, sizeof(int));
+		iov.iov_len = req.nl.nlmsg_len;
+		sendmsg(fd, &msg, 0);
 	}
+	close(fd);
 }
 
 
