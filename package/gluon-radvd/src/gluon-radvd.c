@@ -842,7 +842,12 @@ static void send_advert(void) {
 
 
 static void usage(void) {
-	fprintf(stderr, "Usage: gluon-radvd [-h] -i <interface> -m <mesh_iface> -t <routing table> -a/-p <prefix> [ -a/-p <prefix> ... ]\n");
+	fprintf(stderr,
+		"Usage:\n"
+		"  gluon-radvd -h\n"
+		"  gluon-radvd -i <server interface>\n"
+		"    [-l <client interface> -t <routing table> [-m <mesh_iface>]]\n"
+		"    -a/-p <prefix> [ -a/-p <prefix> ... ]\n");
 }
 
 static void add_prefix(const char *prefix, bool adv_onlink) {
@@ -883,7 +888,7 @@ static void add_prefix(const char *prefix, bool adv_onlink) {
 
 static void parse_cmdline(int argc, char *argv[]) {
 	int c;
-	while ((c = getopt(argc, argv, "i:a:p:h")) != -1) {
+	while ((c = getopt(argc, argv, "i:a:l:p:ht:m:")) != -1) {
 		switch(c) {
 		case 'i':
 			if (G.ifname_server)
@@ -931,8 +936,10 @@ int main(int argc, char *argv[]) {
 	size_t i;
 	parse_cmdline(argc, argv);
 
-	if (!G.ifname_server || !G.n_prefixes)
-		error(1, 0, "interface and prefix arguments are required.");
+	if (!G.ifname_server)
+		error(1, 0, "server interface required");
+	if (!G.n_prefixes && !G.n_client_ifs)
+		error(1, 0, "client interfaces or prefix arguments required.");
 
 	init_random();
 	init_icmp_server();
