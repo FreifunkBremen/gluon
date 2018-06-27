@@ -1,4 +1,4 @@
-GLUON_FEEDS='packages routing luci gluon'
+GLUON_FEEDS='packages routing luci gluon wifictld'
 
 OPENWRT_REPO=https://git.openwrt.org/openwrt/openwrt.git
 OPENWRT_BRANCH=openwrt-18.06
@@ -18,3 +18,6 @@ PACKAGES_LUCI_COMMIT=4ba85e3d82b684262c570e38a72d2dc3bb712a13
 
 PACKAGES_GLUON_REPO=https://github.com/freifunk-gluon/packages.git
 PACKAGES_GLUON_COMMIT=be2c35785994e443d895225c7240474a46f64f5e
+
+PACKAGES_WIFICTLD_REPO=git@dev.sum7.eu:wifictld/wifictld.git
+PACKAGES_WIFICTLD_COMMIT=69ff5a62caedb7d523624f892bffff0b80753f46

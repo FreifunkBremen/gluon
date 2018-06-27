@@ -1,0 +1,72 @@
+From b1781d223b4c06194cb6ab0809e9240db980f03f Mon Sep 17 00:00:00 2001
+From: Martin/Geno <geno+dev@fireorbit.de>
+Date: Mon, 16 Jul 2018 08:35:51 +0200
+Subject: [PATCH] wifictld with parameters for a high density network (for
+ batman)
+
+---
+ wireless/wifictld/Makefile                       |  1 +
+ wireless/wifictld/files/etc/init.d/wifictld      |  2 +-
+ .../luasrc/lib/gluon/ebtables/350-mcast-wifictld |  1 +
+ .../lib/gluon/upgrade/400-wifictld-firewall      | 16 ++++++++++++++++
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+ create mode 100755 wireless/wifictld/luasrc/lib/gluon/ebtables/350-mcast-wifictld
+ create mode 100755 wireless/wifictld/luasrc/lib/gluon/upgrade/400-wifictld-firewall
+
+diff --git a/wireless/wifictld/Makefile b/wireless/wifictld/Makefile
+index 7d25c8d..1279281 100644
+--- a/wireless/wifictld/Makefile
++++ b/wireless/wifictld/Makefile
+@@ -55,6 +55,7 @@ define Package/wifictld/install
+ 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/wifictld $(1)/usr/sbin/
+ 	$(INSTALL_DIR) $(1)/etc/init.d/
+ 	$(INSTALL_BIN) ./files/etc/init.d/wifictld $(1)/etc/init.d/
++	$(CP) ./luasrc/. $(1)/
+ endef
+ 
+ Package/wifictld-mini/install = $(Package/hostapd/install)
+diff --git a/wireless/wifictld/files/etc/init.d/wifictld b/wireless/wifictld/files/etc/init.d/wifictld
+index fb42f08..e85ef8e 100644
+--- a/wireless/wifictld/files/etc/init.d/wifictld
++++ b/wireless/wifictld/files/etc/init.d/wifictld
+@@ -13,7 +13,7 @@ start_service () {
+ 	procd_set_param stdout 1
+ 	procd_set_param stderr 1
+ 	procd_set_param respawn ${respawn_threshold:-3660} ${respawn_timeout:-5} ${respawn_retry:-0}
+-	procd_set_param command "$PROG"
++	procd_set_param command "$PROG" --if br-client --maddr ff02::31f1 --port 1000 --clean-authed=1 --force=1 --force-probe=1 --socket-learning=0
+ 	procd_set_param watch network.wireless
+ 	procd_close_instance
+ }
+diff --git a/wireless/wifictld/luasrc/lib/gluon/ebtables/350-mcast-wifictld b/wireless/wifictld/luasrc/lib/gluon/ebtables/350-mcast-wifictld
+new file mode 100755
+index 0000000..5ed248d
+--- /dev/null
++++ b/wireless/wifictld/luasrc/lib/gluon/ebtables/350-mcast-wifictld
+@@ -0,0 +1 @@
++rule 'MULTICAST_OUT -p IPv6 --ip6-protocol udp --ip6-destination ff02::31f1 --ip6-destination-port 1000 -j RETURN'
+diff --git a/wireless/wifictld/luasrc/lib/gluon/upgrade/400-wifictld-firewall b/wireless/wifictld/luasrc/lib/gluon/upgrade/400-wifictld-firewall
+new file mode 100755
+index 0000000..b904ce9
+--- /dev/null
++++ b/wireless/wifictld/luasrc/lib/gluon/upgrade/400-wifictld-firewall
+@@ -0,0 +1,16 @@
++#!/usr/bin/lua
++
++local uci = require('simple-uci').cursor()
++local site = require('gluon.site')
++
++
++uci:section('firewall', 'rule',  'mesh_wifictld', {
++	name = 'mesh_wifictld',
++	src = 'mesh',
++	src_ip = 'fe80::/64',
++	dest_port = '1000',
++	proto = 'udp',
++	target = 'ACCEPT',
++})
++
++uci:save('firewall')
+-- 
+2.18.0
+
