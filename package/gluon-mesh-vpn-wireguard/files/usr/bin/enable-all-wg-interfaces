@@ -1,0 +1,11 @@
+#!/bin/sh
+
+get_down_wg_interfaces() {
+  ubus -S call network.interface dump | jsonfilter -e '@.interface[@.up=false && @.proto="gluon_wireguard"].interface'
+}
+
+for i in $(get_down_wg_interfaces)
+do
+  ifup $i
+done
+
