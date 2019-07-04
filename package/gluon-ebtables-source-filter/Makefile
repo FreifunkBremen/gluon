@@ -8,7 +8,7 @@ include ../gluon.mk
 
 define Package/gluon-ebtables-source-filter
   TITLE:=Ebtables rules to filter unreasonable L2 traffic.
-  DEPENDS:=+gluon-core +gluon-ebtables gluon-mesh-batman-adv
+  DEPENDS:=+gluon-core +gluon-ebtables
 endef
 
 define Package/gluon-ebtables-source-filter/description
